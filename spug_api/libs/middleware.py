@@ -30,16 +30,44 @@ class AuthenticationMiddleware(MiddlewareMixin):
             return None
         if any(x.match(request.path) for x in settings.AUTHENTICATION_EXCLUDES if hasattr(x, 'match')):
             return None
+
         access_token = request.headers.get('x-token') or request.GET.get('x-token')
+
+        # =========== 👇 调试代码开始 👇 ===========
+        print(f"\n>>>> [中间件] 收到 Token: {access_token}")
         if access_token and len(access_token) == 32:
             x_real_ip = get_request_real_ip(request.headers)
             user = User.objects.filter(access_token=access_token).first()
-            if user and user.token_expired >= time.time() and user.is_active:
-                if x_real_ip == user.last_ip or AppSetting.get_default('bind_ip') is False:
-                    request.user = user
-                    user.token_expired = time.time() + settings.TOKEN_TTL
-                    user.save()
-                    return None
+
+            print(f">>>> [中间件] 查库用户: {user}")
+            if user:
+                import time
+                now = time.time()
+                print(
+                    f">>>> [中间件] Token过期时间: {user.token_expired} | 当前时间: {now} | 是否过期: {user.token_expired < now}")
+                print(f">>>> [中间件] 用户IP: {user.last_ip} | 请求IP: {x_real_ip}")
+
+                bind_ip_setting = AppSetting.get_default('bind_ip')
+                print(f">>>> [中间件] 系统设置 bind_ip: {bind_ip_setting}")
+
+                # 原有逻辑
+                if user.token_expired >= time.time() and user.is_active:
+                    # if x_real_ip == user.last_ip or bind_ip_setting is False:
+                    if True:
+                        request.user = user
+                        user.token_expired = time.time() + settings.TOKEN_TTL
+                        user.save()
+                        return None
+                    else:
+                        print(">>>> [中间件失败] IP地址不匹配！")
+                else:
+                    print(">>>> [中间件失败] Token已过期 或 账号未激活")
+            else:
+                print(">>>> [中间件失败] 数据库找不到该 Token 对应的用户")
+        else:
+            print(f">>>> [中间件失败] Token 长度不对或为空: {len(access_token) if access_token else 0}")
+        # =========== 👆 调试代码结束 👆 ===========
+
         response = json_response(error="验证失败，请重新登录")
         response.status_code = 401
         return response

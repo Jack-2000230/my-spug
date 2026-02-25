@@ -1,6 +1,8 @@
 # Copyright: (c) OpenSpug Organization. https://github.com/openspug/spug
 # Copyright: (c) <spug.dev@gmail.com>
 # Released under the AGPL-3.0 License.
+from io import StringIO
+
 from django.views.generic import View
 from django.db.models import F
 from django.http.response import HttpResponseBadRequest
@@ -19,6 +21,26 @@ from openpyxl import load_workbook
 from threading import Thread
 import socket
 import uuid
+import paramiko
+import json
+import os
+from django.views.generic import View
+from django.http import StreamingHttpResponse, JsonResponse
+from apps.host.models import Host
+# 处理中文文件名编码
+from django.utils.encoding import escape_uri_path
+import traceback
+from apps.setting.utils import AppSetting
+import json
+import paramiko
+import stat
+from datetime import datetime
+from io import StringIO
+from django.views.generic import View
+from django.http import JsonResponse
+from apps.host.models import Host
+from apps.setting.utils import AppSetting
+
 
 
 class HostView(View):
@@ -230,3 +252,177 @@ def _do_host_verify(form):
     except socket.timeout:
         raise Exception('连接主机超时，请检查网络')
     return True
+
+
+class HostFileDownloadView(View):
+    @auth('host.host.view')
+    def post(self, request):
+        ssh = None
+        sftp = None
+        try:
+            data = json.loads(request.body)
+            host_id = data.get('host_id')
+            file_path = data.get('file_path')
+
+            if not host_id or not file_path:
+                return JsonResponse({'error': '参数缺失'}, status=400)
+
+            # 1. 查询主机
+            host = Host.objects.filter(pk=host_id).first()
+            if not host:
+                return JsonResponse({'error': '主机不存在'}, status=404)
+
+            # 2. 获取连接用的私钥 (核心修改逻辑) 🔑
+            # 优先用主机独立的私钥，如果没有，就用系统全局私钥
+            pkey_str = host.pkey
+            if not pkey_str:
+                print(f">>>> [调试] 主机没有独立密钥，尝试获取全局密钥...")
+                pkey_str = AppSetting.get('private_key')
+
+            if not pkey_str:
+                return JsonResponse({'error': '无法连接：未找到主机密钥，也未配置全局密钥'}, status=500)
+
+            # 3. 创建 SSH 密钥对象
+            try:
+                pkey = paramiko.RSAKey.from_private_key(StringIO(pkey_str))
+            except Exception as e:
+                return JsonResponse({'error': f'私钥格式错误: {str(e)}'}, status=500)
+
+            # 4. 建立 SSH 连接
+            # Spug 的逻辑是：有密钥就只用密钥，不看密码
+            ssh = paramiko.SSHClient()
+            ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+
+            print(f">>>> [调试] 正在连接... IP:{host.hostname} User:{host.username}")
+
+            ssh.connect(
+                hostname=host.hostname,
+                port=host.port,
+                username=host.username,
+                pkey=pkey,  # 👈 只传密钥
+                timeout=10,
+                look_for_keys=False,  # 禁止自动搜索本地 ~/.ssh/ 目录
+                allow_agent=False  # 禁止使用 SSH 代理
+            )
+
+            # 5. 开启 SFTP 下载
+            sftp = ssh.open_sftp()
+
+            try:
+                sftp.stat(file_path)
+            except FileNotFoundError:
+                sftp.close()
+                ssh.close()
+                return JsonResponse({'error': f'远程文件不存在: {file_path}'}, status=404)
+
+            remote_file = sftp.open(file_path, 'rb')
+
+            def file_iterator(file_obj, chunk_size=8192):
+                try:
+                    while True:
+                        data = file_obj.read(chunk_size)
+                        if not data:
+                            break
+                        yield data
+                finally:
+                    # 确保流传输结束或中断时关闭连接
+                    if file_obj: file_obj.close()
+                    if sftp: sftp.close()
+                    if ssh: ssh.close()
+                    print(">>>> [调试] 连接已关闭")
+
+            filename = os.path.basename(file_path)
+            response = StreamingHttpResponse(file_iterator(remote_file))
+            response['Content-Type'] = 'application/octet-stream'
+            response['Content-Disposition'] = f'attachment; filename="{escape_uri_path(filename)}"'
+            return response
+
+        except Exception as e:
+            traceback.print_exc()
+            # 如果连接还没建立成功就报错，手动关闭资源
+            if sftp: sftp.close()
+            if ssh: ssh.close()
+            return JsonResponse({'error': f"系统异常: {str(e)}"}, status=500)
+
+class HostFileListView(View):
+            def post(self, request):
+                ssh = None
+                sftp = None
+                try:
+                    data = json.loads(request.body)
+                    host_id = data.get('host_id')
+                    # 如果没传路径，默认去根目录 /
+                    path = data.get('path', '/')
+
+                    if not host_id:
+                        return JsonResponse({'error': '参数缺失'}, status=400)
+
+                    # 1. 获取主机和密钥 (复用之前的逻辑)
+                    host = Host.objects.filter(pk=host_id).first()
+                    if not host:
+                        return JsonResponse({'error': '主机不存在'}, status=404)
+
+                    pkey_str = host.pkey
+                    if not pkey_str:
+                        pkey_str = AppSetting.get('private_key')
+
+                    if not pkey_str:
+                        return JsonResponse({'error': '未找到有效密钥'}, status=500)
+
+                    try:
+                        pkey = paramiko.RSAKey.from_private_key(StringIO(pkey_str))
+                    except Exception as e:
+                        return JsonResponse({'error': f'密钥格式错误: {str(e)}'}, status=500)
+
+                    # 2. 连接 SSH
+                    ssh = paramiko.SSHClient()
+                    ssh.set_missing_host_key_policy(paramiko.AutoAddPolicy())
+                    ssh.connect(
+                        hostname=host.hostname,
+                        port=host.port,
+                        username=host.username,
+                        pkey=pkey,
+                        timeout=5,
+                        look_for_keys=False,
+                        allow_agent=False
+                    )
+
+                    sftp = ssh.open_sftp()
+
+                    # 3. 获取文件列表 (核心逻辑)
+                    # 类似于 Java 的 File.listFiles()
+                    try:
+                        # listdir_attr 可以获取文件属性（大小、时间等）
+                        file_attrs = sftp.listdir_attr(path)
+                    except IOError:
+                        return JsonResponse({'error': f'无法访问路径: {path} (可能是权限不足或路径不存在)'}, status=400)
+
+                    result = []
+                    for attr in file_attrs:
+                        # 过滤掉 . 和 ..
+                        if attr.filename in ['.', '..']:
+                            continue
+
+                        # 判断是文件夹还是文件
+                        is_dir = stat.S_ISDIR(attr.st_mode)
+                        # 如果是链接，也可以视为文件或文件夹，这里简单处理，链接也当文件展示或者根据实际指向判断
+                        # 简单起见，我们只标记是否为文件夹
+
+                        result.append({
+                            'name': attr.filename,
+                            'is_dir': is_dir,
+                            'size': attr.st_size,  # 字节单位
+                            'modify_time': datetime.fromtimestamp(attr.st_mtime).strftime('%Y-%m-%d %H:%M:%S')
+                        })
+
+                    # 4. 排序：文件夹排前面，文件排后面，按名称排序
+                    # 这是一个很贴心的细节，前端展示会更好看
+                    result.sort(key=lambda x: (not x['is_dir'], x['name']))
+
+                    return JsonResponse({'data': result, 'current_path': path})
+
+                except Exception as e:
+                    return JsonResponse({'error': str(e)}, status=500)
+                finally:
+                    if sftp: sftp.close()
+                    if ssh: ssh.close()
